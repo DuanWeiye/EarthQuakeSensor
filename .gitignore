@@ -1,0 +1,14 @@
+# 真实 WiFi/服务器配置不入库
+firmware/config.h
+# 本机专属配置(工具链路径 + 烧录目标序列号)
+device.conf
+# 本机设备留档(含设备序列号/MAC)
+DEVICE.md
+# 内部设计/计划文档(本地保留, 不发布)
+docs/
+# 编译产物
+*.bin
+/test/*.out
+/test/build_*.out
+/test/build/
+__pycache__/

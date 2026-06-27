@@ -1,0 +1,17 @@
+# device.conf.example — 复制为 device.conf 并按你的机器/设备填写。
+#   cp device.conf.example device.conf
+# device.conf 不入库(见 .gitignore)，避免本机路径/设备序列号泄露。
+# build.sh 会 source 本文件。
+
+# Arduino 1.8.19 CLI 可执行文件路径
+ARDUINO="$HOME/Downloads/arduino-1.8.19/arduino"
+
+# esptool.py 路径(随 m5stack esp32 包安装, 版本号按实际)
+ESPTOOL="$HOME/.arduino15/packages/m5stack/tools/esptool_py/4.5.1/esptool.py"
+
+# boot_app0.bin 路径(随 m5stack esp32 包安装)
+BOOT_APP="$HOME/.arduino15/packages/m5stack/hardware/esp32/2.1.4/tools/partitions/boot_app0.bin"
+
+# 烧录目标 = 你这台设备的 by-id 路径(写死, 从根上防刷错到别的板子)。
+# 接上设备后执行: ls -l /dev/serial/by-id/   找到对应的 usb-...-if00-port0 条目填这里。
+EQ_FLASH_TARGET="/dev/serial/by-id/usb-XXXXXXXXXXXX-if00-port0"
