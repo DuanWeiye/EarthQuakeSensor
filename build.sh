@@ -16,8 +16,10 @@ source "$SCRIPT_DIR/device.conf"
 SKETCH="$SCRIPT_DIR/firmware/firmware.ino"
 TARGET="${EQ_FLASH_TARGET:-}"
 
+# PartitionScheme=min_spiffs: 双 OTA 分区(各 1.875MB), 支持空中升级(OTA)。
+# 注意: 分区表只能靠线刷改, 不能靠 OTA 改 —— 故首刷必须用此方案。
 FQBN="m5stack:esp32:m5stack_atom:\
-FlashMode=dio,FlashFreq=80,FlashSize=4M,PartitionScheme=huge_app,\
+FlashMode=dio,FlashFreq=80,FlashSize=4M,PartitionScheme=min_spiffs,\
 CPUFreq=240,UploadSpeed=1500000,DebugLevel=none,LoopCore=1,EventsCore=1,EraseFlash=none"
 BUILD_DIR="/tmp/eq_build"; OUT_DIR="$SCRIPT_DIR"; BIN_NAME="earthQuakeSensor.bin"
 DO_BUILD=1; DO_FLASH=0

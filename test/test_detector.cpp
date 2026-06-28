@@ -103,6 +103,22 @@ int main(){
     check("移位后 led 灭", !d.led_on());
   }
 
+  // 7) 自适应曲线: 50s 长震 -> 包络格宽自动翻倍, 仍全程覆盖、点数不超上限
+  {
+    Detector d=mk(fs);
+    quiet(d,200);
+    for(int i=0;i<5000;i++){ float s=60.0f*std::sin(2*M_PI*2.0*i/fs); d.push(s,0,980.665f); } // 50s
+    quiet(d,200);
+    EventSummary ev; bool got=d.poll_event(ev);
+    check("长事件入库", got);
+    check("长事件 dur≈50s", got && ev.dur_s>45.0);
+    check("格宽已翻倍(>100ms)", got && ev.env_dt_ms>100.0);
+    check("点数不超上限", got && ev.env_n>0 && ev.env_n<=EQ_ENV_CAP);
+    double cover = got ? ev.env_n*ev.env_dt_ms/1000.0 : 0.0;   // 曲线覆盖时长(含 hold-off 拖尾)
+    check("曲线全程覆盖(无截断)", got && cover > ev.dur_s && cover < ev.dur_s+3.0);
+    check("长事件 keisoku>0(不限长)", got && ev.keisoku>0.0);
+  }
+
   std::printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
   return fails?1:0;
 }

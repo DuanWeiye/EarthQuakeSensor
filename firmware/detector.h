@@ -1,14 +1,18 @@
 #pragma once
 #include <cstdint>
+#include "jma_stream.h"
 
-static const int EQ_ENV_CAP = 200;   // 包络上限点数, 100ms/点 -> 20s(更长事件截断)
+// 包络格数上限。画满后格宽翻倍(相邻取max合并), 任意长度事件都能全程覆盖,
+// 只是超长事件时间分辨率自适应变粗(100ms->200ms->400ms...)。
+static const int EQ_ENV_CAP = 300;
 
 // 一次震动事件的摘要。时间为相对秒(由样本计数/fs 推算)；幅度单位 gal。
 struct EventSummary {
   double start_s, end_s, dur_s;       // dur_s = 超阈震动跨度(不含 hold-off 尾巴)
   double peak_gal, peak_h_gal, peak_v_gal, rms_gal, keisoku;
   bool clipped;                       // ±4g 触顶
-  int env_n;                          // 100ms 包络点数
+  int env_n;                          // 包络点数
+  double env_dt_ms;                   // 每格时间宽度(ms); 自适应, 超长事件会 >100
   float env_tot[EQ_ENV_CAP];
   float env_h[EQ_ENV_CAP];
   float env_v[EQ_ENV_CAP];
@@ -28,6 +32,7 @@ struct DetConfig {
 class Detector {
  public:
   Detector(double fs, const DetConfig& cfg);
+  void begin();                              // setup 中调用(堆就绪后): 预构建流式震度 FIR 抽头
   void set_config(const DetConfig& cfg);     // 运行期热更新(仅在采样任务里调用, 无锁)
   DetConfig get_config() const { return cfg_; }
   bool push(float ax, float ay, float az);   // 返回当前是否震动中(瞬时)
@@ -39,17 +44,16 @@ class Detector {
  private:
   double fs_;
   DetConfig cfg_;
+  JmaStream jma_;                                   // 流式計測震度(取代旧 2048 FFT 缓冲)
   double gx_=0, gy_=0, gz_=0; bool gInit_=false;   // 重力 EMA(始终更新)
   double nf_=0;                                     // 噪声底(|d| 慢 EMA)
   float recentPeak_=0;                             // 遥测滚动峰值
   bool active_=false, ledOn_=false; int belowCnt_=0, aboveCnt_=0;
   uint64_t sampleIdx_=0, evStart_=0, lastAbove_=0;
   double pk_=0, pkH_=0, pkV_=0, sumSq_=0; uint64_t cnt_=0; bool clip_=false;
+  // 自适应包络: 当前每格样本数 envSpb_(画满翻倍), 各格记峰值
   float envTot_[EQ_ENV_CAP], envH_[EQ_ENV_CAP], envV_[EQ_ENV_CAP]; int envN_=0;
-  static const int CAP = 2048;
-  float bx_[CAP], by_[CAP], bz_[CAP]; int head_=0, len_=0;
+  int envSpb_=0;
   bool pending_=false; EventSummary done_{};
-  void pushBuf(float ax,float ay,float az);
-  double finalizeKeisoku();
   void resetEvent();
 };
