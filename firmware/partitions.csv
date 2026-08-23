@@ -1,0 +1,11 @@
+# earthQuakeSensor 自定义分区表(4MB flash)。放在 sketch 目录即被 arduino-esp32 core 自动采用(覆盖 FQBN 的 PartitionScheme)。
+# 与 min_spiffs 的差别: app 从 2x1.875MB 缩到 2x1.44MB(固件 ~1.05MB, 余量 27%), 腾出 1MB 专用 "wavelog" 数据区
+# 存原始波形日志(256 个 4KB 扇区 = 256 块 x 5s ≈ 21 分钟), 断网时留存、联网后补传; 不再保留无用的 SPIFFS。
+# 分区表只能线刷, 不能靠 OTA 改: 首刷必须线刷, 之后 OTA 照常(双 app 分区 + 回滚不变)。
+# Name,    Type, SubType,  Offset,   Size,     Flags
+nvs,       data, nvs,      0x9000,   0x5000,
+otadata,   data, ota,      0xe000,   0x2000,
+app0,      app,  ota_0,    0x10000,  0x170000,
+app1,      app,  ota_1,    0x180000, 0x170000,
+wavelog,   data, 0x40,     0x2F0000, 0x100000,
+coredump,  data, coredump, 0x3F0000, 0x10000,

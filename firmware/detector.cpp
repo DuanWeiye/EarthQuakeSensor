@@ -11,6 +11,15 @@ void Detector::begin(){ jma_.reset(); }
 
 void Detector::set_config(const DetConfig& cfg){ cfg_ = cfg; }
 
+// 一块(1s)|d| 均值入环, 重算 NF_PCT 分位作为噪声底。环最多 NF_WIN 块, 每秒一次 nth_element, 开销可忽略。
+void Detector::nfPushBlock(float v){
+  nfRing_[nfPos_] = v; nfPos_ = (nfPos_+1) % NF_WIN; if(nfN_<NF_WIN) nfN_++;
+  float tmp[NF_WIN]; for(int i=0;i<nfN_;i++) tmp[i]=nfRing_[i];
+  int k = (int)(NF_PCT*(nfN_-1) + 0.5); if(k<0) k=0; if(k>=nfN_) k=nfN_-1;
+  std::nth_element(tmp, tmp+k, tmp+nfN_);
+  nf_ = tmp[k];
+}
+
 float Detector::take_recent_peak(){ float p=recentPeak_; recentPeak_=0; return p; }
 
 void Detector::resetEvent(){
@@ -30,21 +39,31 @@ bool Detector::push(float ax,float ay,float az){
   double dx=ax-gx_, dy=ay-gy_, dz=az-gz_;
   double mag=std::sqrt(dx*dx+dy*dy+dz*dz);
   if(mag>recentPeak_) recentPeak_=(float)mag;        // 遥测: 滚动峰值(供贴电视后看走路多大)
-  double thr=std::max(cfg_.k*nf_, cfg_.floor_min);
-  bool over = mag>thr;
-  // 噪声底只在非事件时缓慢学习
-  if(!active_){ double b=1.0/(fs_*5.0); nf_+=b*(mag-nf_); }
+  // 噪声底: 非事件期按 1s 块累加 |d| 均值入环取分位(事件期冻结, 块累加也清零不让震动混入)
+  if(!active_){
+    nfBlockSum_+=mag; nfBlockCnt_++;
+    if(nfBlockCnt_ >= (int)(fs_+0.5)){ nfPushBlock((float)(nfBlockSum_/nfBlockCnt_)); nfBlockSum_=0; nfBlockCnt_=0; }
+  } else { nfBlockSum_=0; nfBlockCnt_=0; }
+  // 起停迟滞: 触发阈值 thr_on 高(防误报), 收尾阈值 thr_off 低(留住尾波); thr_off 不高于 thr_on
+  double thrOn =std::max(cfg_.k*nf_, cfg_.floor_min);
+  double thrOff=std::min(thrOn, std::max(cfg_.k_off*nf_, cfg_.floor_off));
+  bool over = mag>thrOn;
+  bool overOff = mag>thrOff;
   if(over){
-    aboveCnt_++; belowCnt_=0;
+    aboveCnt_++;
     if(!active_ && aboveCnt_>=3){            // 去抖: 连续 3 样本超阈
       active_=true; evStart_=sampleIdx_-aboveCnt_+1;
+      lastAbove_=lastAboveOff_=sampleIdx_; belowCnt_=0;
       resetEvent();
     }
-  } else { belowCnt_++; aboveCnt_=0; }
+  } else aboveCnt_=0;
   if(active_){
-    if(over) lastAbove_=sampleIdx_;                 // 记最后一次超阈, 用于真实时长
-    // LED: 用"持续晃动跨度"(末次超阈-起点)判定, 达 led_min 即亮(不含 hold-off 静默期)
+    if(over) lastAbove_=sampleIdx_;                 // 末次超触发阈值 -> 强晃跨度
+    if(overOff){ lastAboveOff_=sampleIdx_; belowCnt_=0; } else belowCnt_++;   // 末次超收尾阈值 -> 全程跨度
+    // LED 跟"强晃": 跨度达 led_min 亮; 强晃停了 holdoff 就灭(记录仍可在尾波里继续, 避免红灯闪几分钟像故障)
+    uint64_t holdSamples = (uint64_t)(cfg_.holdoff_s*fs_);
     if(!ledOn_ && (lastAbove_-evStart_+1) >= (uint64_t)(cfg_.led_min_s*fs_+0.5)) ledOn_=true;
+    if(ledOn_ && sampleIdx_-lastAbove_ >= holdSamples) ledOn_=false;
     // 水平/垂直分解: 用重力单位向量
     double gn=std::sqrt(gx_*gx_+gy_*gy_+gz_*gz_); if(gn<1e-6) gn=1;
     double ev=(dx*gx_+dy*gy_+dz*gz_)/gn;             // 垂直分量(沿重力)
@@ -73,17 +92,20 @@ bool Detector::push(float ax,float ay,float az){
     if(mag>envTot_[bin])        envTot_[bin]=(float)mag;
     if(hmag>envH_[bin])         envH_[bin]=(float)hmag;
     if(std::fabs(ev)>envV_[bin]) envV_[bin]=(float)std::fabs(ev);
-    if(belowCnt_ >= (int)(cfg_.holdoff_s*fs_)){      // hold-off 后收尾
-      double dur=(double)(lastAbove_-evStart_+1)/fs_;
+    // 收尾: 低于收尾阈值持续 holdoff; 或强晃停止已超 tail_max(兜底, 防持续弱扰动拖着不结束)
+    bool tailTimeout = (sampleIdx_-lastAbove_) >= (uint64_t)(cfg_.tail_max_s*fs_);
+    if((uint64_t)belowCnt_ >= holdSamples || tailTimeout){
+      double strong=(double)(lastAbove_-evStart_+1)/fs_;
+      double dur=(double)(lastAboveOff_-evStart_+1)/fs_;
       active_=false; belowCnt_=0; ledOn_=false;      // 事件结束, LED 灭
-      if(dur < cfg_.min_dur_s) return active_;       // 时长不够(轻碰), 丢弃
+      if(strong < cfg_.min_dur_s) return active_;    // 强晃时长不够(轻碰), 丢弃
       jma_.finish();                                 // 冲刷 FIR 尾部
       double keis = jma_.keisoku();
       if(keis < cfg_.min_keisoku) return active_;    // 震度不够(走路等小扰动), 丢弃
       EventSummary s{};
       s.start_s=(double)evStart_/fs_;
-      s.end_s=(double)lastAbove_/fs_;
-      s.dur_s=dur;
+      s.end_s=(double)lastAboveOff_/fs_;
+      s.dur_s=dur; s.strong_s=strong;
       s.peak_gal=pk_; s.peak_h_gal=pkH_; s.peak_v_gal=pkV_;
       s.rms_gal= cnt_? std::sqrt(sumSq_/cnt_):0.0;
       s.keisoku=keis;

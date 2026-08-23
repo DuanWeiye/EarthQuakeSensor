@@ -12,3 +12,5 @@ docs/
 /test/build_*.out
 /test/build/
 __pycache__/
+# 数据导出(含设备 MAC, 不入库)
+export/

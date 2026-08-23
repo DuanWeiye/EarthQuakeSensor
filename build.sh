@@ -16,8 +16,9 @@ source "$SCRIPT_DIR/device.conf"
 SKETCH="$SCRIPT_DIR/firmware/firmware.ino"
 TARGET="${EQ_FLASH_TARGET:-}"
 
-# PartitionScheme=min_spiffs: 双 OTA 分区(各 1.875MB), 支持空中升级(OTA)。
-# 注意: 分区表只能靠线刷改, 不能靠 OTA 改 —— 故首刷必须用此方案。
+# 分区表: 实际采用 firmware/partitions.csv(sketch 目录下的自定义表, core 的 prebuild hook 自动覆盖 FQBN 里的
+# PartitionScheme): 双 OTA 分区各 1.44MB + wavelog 1MB 波形日志。FQBN 里仍写 min_spiffs 只是为了让 IDE 的
+# 大小上限/编译宏有个基准。注意: 分区表只能靠线刷改, 不能靠 OTA 改 —— 故首刷必须线刷。
 FQBN="m5stack:esp32:m5stack_atom:\
 FlashMode=dio,FlashFreq=80,FlashSize=4M,PartitionScheme=min_spiffs,\
 CPUFreq=240,UploadSpeed=1500000,DebugLevel=none,LoopCore=1,EventsCore=1,EraseFlash=none"
@@ -35,7 +36,13 @@ if [[ $DO_BUILD -eq 1 ]]; then
   echo "=== 编译 ==="; echo "  FQBN: $FQBN"
   "$ARDUINO" --board "$FQBN" --pref "build.path=$BUILD_DIR" --verify "$SKETCH"
   cp "$BUILD_DIR/firmware.ino.bin" "$OUT_DIR/$BIN_NAME"
-  echo "=== 编译完成: $OUT_DIR/$BIN_NAME ($(stat -c%s "$OUT_DIR/$BIN_NAME") bytes) ==="
+  # 分区表来自 firmware/partitions.csv(自定义, 见该文件注释)。IDE 只按 FQBN 的 PartitionScheme 校验大小,
+  # 不知道自定义 app 分区更小, 这里自己校验: bin 必须装得进 app0, 否则 OTA/启动都会失败。
+  APP_SIZE=$(awk -F'[, ]+' '/^app0/{print $5}' "$SCRIPT_DIR/firmware/partitions.csv")
+  BIN_SIZE=$(stat -c%s "$OUT_DIR/$BIN_NAME")
+  if [[ -n "$APP_SIZE" && $BIN_SIZE -gt $((APP_SIZE)) ]]; then
+    echo "ERROR: 固件 $BIN_SIZE B 超过 app 分区 $((APP_SIZE)) B(firmware/partitions.csv)"; exit 1; fi
+  echo "=== 编译完成: $OUT_DIR/$BIN_NAME ($BIN_SIZE bytes, app 分区 $((APP_SIZE)) B, 占 $((BIN_SIZE*100/APP_SIZE))%) ==="
 fi
 if [[ $DO_FLASH -eq 1 ]]; then
   : "${ESPTOOL:?device.conf 未设置 ESPTOOL}"; : "${BOOT_APP:?device.conf 未设置 BOOT_APP}"
