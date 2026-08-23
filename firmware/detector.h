@@ -40,6 +40,7 @@ class Detector {
   bool led_on() const { return ledOn_; }     // 持续晃动跨度≥led_min 即亮
   bool poll_event(EventSummary& out);        // 有刚结束(且达门限)的事件则取出返回 true
   double noise_floor() const { return nf_; } // 遥测: 当前噪声底(gal)
+  double now_s() const { return (double)sampleIdx_/fs_; } // 当前样本时刻(与 EventSummary.start_s/end_s 同基准)
   float take_recent_peak();                  // 遥测: 自上次以来 |动态| 峰值, 取走并清零
  private:
   double fs_;

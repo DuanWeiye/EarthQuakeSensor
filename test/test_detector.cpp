@@ -39,6 +39,9 @@ int main(){
     check("horizontal dominant", got && ev.peak_h_gal>ev.peak_v_gal);
     check("keisoku>0", got && ev.keisoku>0.0);
     check("not active after end", !d.active());
+    // 时间基准: start_s/end_s 与 now_s 同一采样计数基准, 固件据此把事件起止折算成 epoch
+    check("end_s-start_s ≈ dur", got && std::fabs((ev.end_s-ev.start_s)-ev.dur_s)<0.02);
+    check("now_s 在事件结束之后(含 hold-off)", got && d.now_s()>ev.end_s && d.now_s()-ev.end_s<3.0);
     check("led_off after end", !d.led_on());
     check("env_n>0", got && ev.env_n>0);
     bool envHas=false; for(int i=0;i<ev.env_n;i++) if(ev.env_tot[i]>30.0f) envHas=true;

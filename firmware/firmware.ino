@@ -6,6 +6,7 @@
 //   loop(core 1)      WiFi 维护 / NTP / 取队列 POST 事件 / 拉远程配置 / 心跳(带遥测) / 补发缓冲。
 // 贴电视后只靠网络调参: 设备每 15s 拉一次, 热更新检测门槛, 并存 NVS。
 #include <M5Atom.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -19,7 +20,7 @@
 #include "jma_intensity.h"
 #include "config.h"
 
-static const char*    FW_VER = "eq-1.2.1";    // + 长按按钮触发 OTA + LED 状态指示(蓝检查/蓝闪升级/绿启动)
+static const char*    FW_VER = "eq-1.3.0";    // + 加速度计 DLPF 抗混叠(21Hz) + 事件时间戳按采样时刻精确推算
 static const double   FS = 100.0;
 static const uint32_t WIFI_TIMEOUT_MS = 10000;
 static const int      NVS_RING = 16;          // 断网最多缓冲的事件数(离线只存标量, 省 NVS)
@@ -30,7 +31,10 @@ SET_LOOP_TASK_STACK_SIZE(16384);
 
 Detector detector(FS, DetConfig{});            // 默认门槛(floor30/K6/...), 启动后由 NVS/服务器覆盖
 static char g_mac[18] = {0};
-QueueHandle_t g_evQ = nullptr;                 // EventSummary 队列(采样任务->loop)
+// 采样任务 -> loop 的队列项: 摘要 + 事件起止的设备 millis 时刻。
+// 起止时刻由采样计数精确推算(不再用"收尾时刻-时长"反推), 消除 hold-off/队列延迟带来的固定偏晚。
+struct QueuedEvent { EventSummary ev; uint32_t startMs, endMs; };
+QueueHandle_t g_evQ = nullptr;                 // QueuedEvent 队列(采样任务->loop)
 Preferences prefs;
 
 // --- 遥测(core0 发布, loop 读): 用 volatile float, 32位读写无撕裂; 跨核竞争仅丢极少量, 无害 ---
@@ -43,6 +47,19 @@ volatile bool g_cfgPending = false;
 DetConfig g_pendingCfg;
 DetConfig g_appliedCfg;                         // 最近一次已下发的配置(比较, 变了才下发/存盘)
 bool g_haveApplied = false;
+
+// ---------- IMU ----------
+// MPU6886 加速度计数字低通(ACCEL_CONFIG2.A_DLPF_CFG): 0=218Hz 1=218Hz 2=99Hz 3=44.8Hz 4=21.2Hz 5=10.2Hz 6=5.1Hz。
+// M5Atom 库 Init() 不碰该寄存器(默认 218Hz 带宽, 内部 1kHz 采样), 我们只以 100Hz 读取, 50Hz 以上的
+// 传感器噪声/高频机械振动会混叠进 0~50Hz 带内, 抬高噪声底(实测 ~2.3gal)。地震能量 <10Hz, 取 21.2Hz
+// 既抗混叠又不伤 JMA 通带(G(f) 在 10Hz 本就只剩 0.22)。库把 I2C 写封成 private, 故用同一条 Wire1 直写。
+static void imuSetAccelDlpf(uint8_t cfg){
+  const uint8_t ADDR = 0x68, ACCEL_CONFIG2 = 0x1D;
+  Wire1.beginTransmission(ADDR); Wire1.write(ACCEL_CONFIG2); Wire1.write(cfg & 0x07); Wire1.endTransmission();
+  Wire1.beginTransmission(ADDR); Wire1.write(ACCEL_CONFIG2); Wire1.endTransmission(false);
+  uint8_t rb = 0xFF; if(Wire1.requestFrom(ADDR, (uint8_t)1) == 1) rb = Wire1.read();
+  Serial.printf("[imu] ACCEL_CONFIG2=0x%02X (%s)\n", rb, (rb & 0x07)==(cfg & 0x07) ? "DLPF ok" : "DLPF 写入失败");
+}
 
 // ---------- 时间 ----------
 static time_t nowEpoch(){ time_t t=time(nullptr); return (t>1700000000)?t:0; } // 未同步返回0
@@ -203,9 +220,8 @@ static void fetchConfig(){
 }
 
 // includeEnv=true: 含 100ms 自适应包络(在线上报); false: 只存标量(离线缓冲省 NVS)。
-static void buildEventBody(const EventSummary& ev, time_t evEpoch, char* body, size_t n, bool includeEnv){
-  long end_ts   = evEpoch ? (long)evEpoch : 0;
-  long start_ts = evEpoch ? (long)(evEpoch - (long)(ev.dur_s+0.5)) : 0;
+// start_ts/end_ts: 事件起止 epoch(未对时则 0, 服务器回落为收到时刻)。
+static void buildEventBody(const EventSummary& ev, long start_ts, long end_ts, char* body, size_t n, bool includeEnv){
   int p = snprintf(body, n,
     "{\"mac\":\"%s\",\"fw\":\"%s\",\"start_ts\":%ld,\"end_ts\":%ld,"
     "\"dur_s\":%.1f,\"peak_gal\":%.1f,\"peak_h_gal\":%.1f,\"peak_v_gal\":%.1f,"
@@ -288,12 +304,17 @@ void sampleTask(void*){
       if(millis()-lastBlink>50){ lastBlink=millis(); ledState=!ledState;
         M5.dis.fillpix(ledState?CRGB(0xff0000):CRGB(0x000000)); }      // 事件: 红快闪
     } else if(ledState){ ledState=false; M5.dis.clear(); }
-    EventSummary ev;
-    if(detector.poll_event(ev)){
+    QueuedEvent q;
+    if(detector.poll_event(q.ev)){
+      const EventSummary& ev = q.ev;
+      // 起止时刻: 用"当前样本时刻 - 事件样本时刻"折算成设备 millis(采样严格 100Hz, 误差 <1 tick)
+      uint32_t nowMs = millis(); double tnow = detector.now_s();
+      q.startMs = nowMs - (uint32_t)((tnow - ev.start_s)*1000.0 + 0.5);
+      q.endMs   = nowMs - (uint32_t)((tnow - ev.end_s)*1000.0 + 0.5);
       Serial.printf("[event] dur=%.1fs peak=%.1fgal H=%.1f V=%.1f shindo=%.1f(%s) clip=%d\n",
                     ev.dur_s, ev.peak_gal, ev.peak_h_gal, ev.peak_v_gal,
                     ev.keisoku, shindo_scale(ev.keisoku), ev.clipped);
-      if(g_evQ) xQueueSend(g_evQ, &ev, 0);       // 交给 loop 去 POST(采样不阻塞)
+      if(g_evQ) xQueueSend(g_evQ, &q, 0);        // 交给 loop 去 POST(采样不阻塞)
     }
     vTaskDelayUntil(&last, period);
   }
@@ -305,6 +326,7 @@ void setup(){
   otaCheckBoot();                 // OTA: 成功则清目标; 待确认镜像标记待提交(否则回滚)
   M5.IMU.Init();
   M5.IMU.SetAccelFsr(MPU6886::AFS_4G);   // ±4g, 与 detector 触顶判定一致
+  imuSetAccelDlpf(4);                    // 抗混叠: 加速度计 DLPF 21.2Hz(库默认 218Hz, 100Hz 采样会把高频噪声折进带内)
   M5.dis.clear();                 // 空闲全灭
   Serial.begin(115200);
   detector.begin();               // 堆就绪后预构建流式震度 FIR 抽头(避免全局构造期/首事件分配)
@@ -316,7 +338,7 @@ void setup(){
                   g_appliedCfg.floor_min, g_appliedCfg.k, g_appliedCfg.min_keisoku);
   }
   g_haveApplied = true;
-  g_evQ = xQueueCreate(4, sizeof(EventSummary));   // EventSummary 含包络较大, 队列短即可
+  g_evQ = xQueueCreate(4, sizeof(QueuedEvent));    // 含包络较大(~3.7KB/项), 队列短即可
   wifiConnect();
   if(WiFi.status()==WL_CONNECTED) fetchConfig();    // 开机即拉一次服务器配置
   // 正常启动标识: 绿灯闪一下(在采样任务启动前驱动, 无 LED 竞争)。OTA 后新固件启动也走这里。
@@ -327,14 +349,17 @@ void setup(){
 void loop(){
   handleOtaButton();   // 长按顶部按钮触发的 OTA(检查+升级); LED 已由 core0 驱动
   // 1) 取队列里的事件 POST(失败转 NVS 缓冲)
-  EventSummary ev;
-  if(g_evQ && xQueueReceive(g_evQ, &ev, 0)==pdTRUE){
+  static QueuedEvent q;       // ~3.7KB, static 避免占 loop 栈
+  if(g_evQ && xQueueReceive(g_evQ, &q, 0)==pdTRUE){
     static char body[8192];   // 含 300 点自适应包络, static 避免占 loop 栈
-    time_t ts = nowEpoch();
-    buildEventBody(ev, ts, body, sizeof(body), true);        // 完整(含包络)上报
+    // 事件起止 epoch = 当前 epoch - (当前 millis - 事件 millis): 不受 hold-off 与队列/网络延迟影响
+    time_t now = nowEpoch(); uint32_t ms = millis();
+    long start_ts = now ? (long)now - (long)((ms - q.startMs + 500) / 1000) : 0;
+    long end_ts   = now ? (long)now - (long)((ms - q.endMs   + 500) / 1000) : 0;
+    buildEventBody(q.ev, start_ts, end_ts, body, sizeof(body), true);        // 完整(含包络)上报
     if(!postJson("", body)){
       static char cbody[1024];
-      buildEventBody(ev, ts, cbody, sizeof(cbody), false);   // 离线只存标量(无包络), 省 NVS
+      buildEventBody(q.ev, start_ts, end_ts, cbody, sizeof(cbody), false);   // 离线只存标量(无包络), 省 NVS
       bufferEvent(cbody);
     }
   }
