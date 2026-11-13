@@ -26,7 +26,7 @@
 #include "jma_intensity.h"
 #include "config.h"
 
-static const char*    FW_VER = "eq-1.5.0";    // + 原始波形 flash 日志(断网补传/断电留存, 自定义分区表 wavelog 1MB)
+static const char*    FW_VER = "eq-1.5.1";    // + 关 WiFi 省电 + 配置随心跳响应下发(每轮少一条 TLS 连接)
 static const double   FS = 100.0;
 static const uint32_t WIFI_TIMEOUT_MS = 10000;
 static const int      NVS_RING = 16;          // 断网最多缓冲的事件数(离线只存标量, 省 NVS)
@@ -109,7 +109,11 @@ static int64_t idxToEpochMs(uint32_t idx){
 // ---------- WiFi ----------
 static bool wifiConnect(){
   if(WiFi.status()==WL_CONNECTED) return true;
-  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.mode(WIFI_STA);
+  // 关 modem sleep: 设备插墙电不缺这点功耗; 开着时 AP 要替它缓存下行包等它醒来再投递,
+  // 一次 TLS 握手被拖到 ~1s, 同一 AP 上的其它 2.4G 终端跟着卡顿。
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0=millis();
   while(WiFi.status()!=WL_CONNECTED && millis()-t0<WIFI_TIMEOUT_MS){ delay(200); }
   if(WiFi.status()==WL_CONNECTED){
@@ -125,19 +129,21 @@ static bool wifiConnect(){
 
 // ---------- HTTP ----------
 // path 为相对 REPORT_BASE 的后缀(可带查询串): ""=事件上报, "/config"=拉配置, "/heartbeat"=心跳, "/wave?..."=波形块。
-static bool postBytes(const char* path, const char* contentType, const uint8_t* data, size_t len){
+// resp 非空且 HTTP 200 时带回响应体(心跳响应里有服务器配置)。
+static bool postBytes(const char* path, const char* contentType, const uint8_t* data, size_t len, String* resp=nullptr){
   if(WiFi.status()!=WL_CONNECTED) return false;
   WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(8);
   HTTPClient http; String url=String(REPORT_BASE)+path;
   if(!http.begin(cli, url)) return false;
   http.addHeader("Content-Type", contentType);
   int code=http.POST((uint8_t*)data, len);
+  if(resp && code==200) *resp = http.getString();
   http.end();
   Serial.printf("[post] %.*s HTTP %d (%u B)\n", 24, path, code, (unsigned)len);
   return code>0 && code<400;
 }
-static bool postJson(const char* path, const char* body){
-  return postBytes(path, "application/json", (const uint8_t*)body, strlen(body));
+static bool postJson(const char* path, const char* body, String* resp=nullptr){
+  return postBytes(path, "application/json", (const uint8_t*)body, strlen(body), resp);
 }
 
 static String getJson(const char* path){
@@ -243,10 +249,9 @@ static void handleOtaButton(){
   g_ledMode = LED_NORMAL;                           // 无更新/失败: 回正常
 }
 
-// 拉服务器配置; 与上次不同才热更新到采样任务 + 存 NVS。服务器是配置权威源。
-// (OTA 不在此自动触发, 改由长按按钮 handleOtaButton 主动检查升级。)
-static void fetchConfig(){
-  String body = getJson("/config");
+// 应用服务器下发的配置(GET /config 或心跳响应, 同一 JSON 结构); 与上次不同才热更新到采样任务 + 存 NVS。
+// 服务器是配置权威源。(OTA 不在此自动触发, 改由长按按钮 handleOtaButton 主动检查升级。)
+static void applyServerConfig(const String& body){
   if(!body.length()) return;
   JsonDocument doc;
   if(deserializeJson(doc, body)) return;
@@ -271,6 +276,8 @@ static void fetchConfig(){
   Serial.printf("[cfg] 下发 K=%.1f floor=%.1f hold=%.1f minDur=%.1f led=%.1f minK=%.2f Koff=%.1f floorOff=%.1f tailMax=%.0f\n",
                 n.k, n.floor_min, n.holdoff_s, n.min_dur_s, n.led_min_s, n.min_keisoku, n.k_off, n.floor_off, n.tail_max_s);
 }
+// 开机时主动拉一次(之后随每次心跳响应更新)。
+static void fetchConfig(){ applyServerConfig(getJson("/config")); }
 
 // includeEnv=true: 含 100ms 自适应包络(在线上报); false: 只存标量(离线缓冲省 NVS)。
 // start_ms/end_ms: 事件起止 epoch 毫秒(未对时则 0, 服务器回落为收到时刻); start_ts/end_ts 为其秒值。
@@ -530,7 +537,7 @@ void loop(){
     }
   }
 
-  // 3) WiFi 维护; 每 15s: 拉远程配置 + 补发 + 心跳(带噪声/峰值/堆遥测) + 空闲时刷新时间锚
+  // 3) WiFi 维护; 每 15s: 补发 + 心跳(带噪声/峰值/堆遥测, 响应带回远程配置) + 空闲时刷新时间锚
   static uint32_t lastWifi=0, lastTick=0, lastMaint=0;
   if(WiFi.status()!=WL_CONNECTED && millis()-lastWifi>5000){ lastWifi=millis(); wifiConnect(); }
   // 日志维护: 空闲时每 5s 擦一个已发/坏扇区(擦除会停采样核 ~45ms, 所以零散做、事件中不做), 给下次事件备好空白
@@ -539,7 +546,6 @@ void loop(){
     lastTick=millis();
     if(!g_evActive && !g_ws.active) refreshTimeAnchor();   // 事件/上报进行中不动锚, 保证同一事件内时刻一致
     if(WiFi.status()==WL_CONNECTED){
-      fetchConfig();                              // 拉配置热更新
       flushBuffer();
       float peak = g_peakGal; g_peakGal = 0;      // 取走峰值(本窗口最大)
       const DetConfig& a = g_appliedCfg;          // 回报设备实际生效的配置(供面板确认下发到位)
@@ -555,7 +561,11 @@ void loop(){
         g_wlog.countUnsent(), g_wlog.sectors(),
         a.k, a.floor_min, a.holdoff_s, a.min_dur_s, a.led_min_s, a.min_keisoku,
         a.k_off, a.floor_off, a.tail_max_s);
-      if(postJson("/heartbeat", hb)) otaConfirmIfPending();   // 联网成功 -> 确认新固件
+      String resp;
+      if(postJson("/heartbeat", hb, &resp)){
+        otaConfirmIfPending();                    // 联网成功 -> 确认新固件
+        applyServerConfig(resp);                  // 配置热更新(下一次心跳回报生效值)
+      }
     }
     // OTA 待确认超时(5min 仍未联网成功): 重启触发回滚到旧固件
     if(g_otaPending && millis()-g_bootMs > 300000){
