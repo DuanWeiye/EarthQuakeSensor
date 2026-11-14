@@ -1,12 +1,12 @@
 // Atom-Matrix 震动传感器：MPU6886 100Hz 采样 -> Detector -> 事件中整屏红灯快闪
-// 事件结束把摘要 HTTPS POST 给家里的 iot 服务；断网 NVS 缓冲, 重连补发。
+// 事件结束把摘要 HTTP POST 给家里的 iot 服务(局域网明文, 复用一条 keep-alive 连接)；断网 NVS 缓冲, 重连补发。
 // 事件进行中同时把 100Hz 三轴原始波形(含触发前 WAVE_PRE_S 秒)分块流式上报, 时长不限:
 // 块先写进 flash 日志分区(wavelog, 见 partitions.csv), 再由网络核按序上传; 断网时留在 flash, 联网后补传; 断电后开机扫描恢复。
 //
 // 任务划分：
 //   采样任务(core 0)  只读 IMU + 写原始环缓冲 + 喂检测器 + 驱动 LED + 把结束的事件入队 + 发布遥测, 绝不被网络阻塞。
 //   loop(core 1)      WiFi 维护 / NTP / 取队列 POST 事件 / 原始波形分块上报 / 拉远程配置 / 心跳(带遥测) / 补发缓冲。
-// 检测门槛全部网络热更新: 设备每 15s 拉一次, 并存 NVS。
+// 检测门槛全部网络热更新: 随每 15s 的心跳响应下发, 并存 NVS。
 #include <M5Atom.h>
 #include <Wire.h>
 #include <WiFi.h>
@@ -25,8 +25,11 @@
 #include "esp_partition.h"
 #include "jma_intensity.h"
 #include "config.h"
+#ifndef OTA_BASE
+#error "config.h 缺 OTA_BASE(OTA 下载用的 https 基址), 见 config.example.h"
+#endif
 
-static const char*    FW_VER = "eq-1.5.1";    // + 关 WiFi 省电 + 配置随心跳响应下发(每轮少一条 TLS 连接)
+static const char*    FW_VER = "eq-1.6.0";    // + 上报改局域网明文 HTTP + 复用一条 keep-alive 连接(OTA 仍 HTTPS)
 static const double   FS = 100.0;
 static const uint32_t WIFI_TIMEOUT_MS = 10000;
 static const int      NVS_RING = 16;          // 断网最多缓冲的事件数(离线只存标量, 省 NVS)
@@ -106,9 +109,14 @@ static int64_t idxToEpochMs(uint32_t idx){
   return g_anchorMs + (int64_t)(int32_t)(idx - g_anchorIdx) * (int64_t)(1000.0/FS + 0.5);
 }
 
+// 上报用的常驻 HTTP 连接(见下方 HTTP 段); 放在 WiFi 段之前, 重连时要先丢弃它。
+static WiFiClient g_net;
+static HTTPClient g_http;   // 必须常驻: HTTPClient 析构会 stop() 掉连接, 局部对象没法复用
+
 // ---------- WiFi ----------
 static bool wifiConnect(){
   if(WiFi.status()==WL_CONNECTED) return true;
+  g_net.stop();             // 断网前的 TCP 连接已失效, 重连后从新连接开始
   WiFi.mode(WIFI_STA);
   // 关 modem sleep: 设备插墙电不缺这点功耗; 开着时 AP 要替它缓存下行包等它醒来再投递,
   // 一次 TLS 握手被拖到 ~1s, 同一 AP 上的其它 2.4G 终端跟着卡顿。
@@ -128,17 +136,36 @@ static bool wifiConnect(){
 }
 
 // ---------- HTTP ----------
+// 上报走局域网明文 HTTP(REPORT_BASE), 所有请求复用 g_net 这一条 keep-alive 连接: 每 15s 的心跳只剩一来一回两个小包。
+// 以前每轮新建 TLS 连接, 握手下行约 5KB 证书, 设备离 AP 远时低速率+重传会长时间占住空口, 拖慢同 AP 的其它终端。
+// 服务器(apache :80)KeepAliveTimeout 30s, 大于心跳间隔。复用的连接可能已被对端关掉: 这次失败就换新连接重发一次
+// (事件、波形块服务器按内容幂等去重, 心跳重复无害)。新建的连接也失败才算失败。
 // path 为相对 REPORT_BASE 的后缀(可带查询串): ""=事件上报, "/config"=拉配置, "/heartbeat"=心跳, "/wave?..."=波形块。
-// resp 非空且 HTTP 200 时带回响应体(心跳响应里有服务器配置)。
+// data 为空发不带体的请求。返回 HTTP 状态码, <=0 为连接/收发失败。resp 非空且 HTTP 200 时带回响应体。
+static int httpRequest(const char* method, const char* path, const char* contentType,
+                       const uint8_t* data, size_t len, String* resp){
+  if(WiFi.status()!=WL_CONNECTED) return -1;
+  String url=String(REPORT_BASE)+path;
+  int code=-1;
+  for(int attempt=0; attempt<2; attempt++){
+    bool reused = g_net.connected();
+    if(!g_http.begin(g_net, url)) return -1;
+    g_http.setReuse(true);
+    g_http.setTimeout(8000);
+    if(contentType) g_http.addHeader("Content-Type", contentType);
+    // HTTPClient 只在体非空时发 Content-Length; 空体的 POST 不带它会被 apache 回 411
+    if(len==0 && strcmp(method, "GET")!=0) g_http.addHeader("Content-Length", "0");
+    code = g_http.sendRequest(method, (uint8_t*)data, len);
+    String body = code>0 ? g_http.getString() : String();   // 响应体读完, 连接才能干净地给下一个请求用
+    if(code<=0) g_net.stop();                               // 收发失败, 连接状态不明, 丢掉
+    g_http.end();                                           // 可复用则保持连接, 否则关闭
+    if(code>0){ if(resp && code==200) *resp=body; break; }
+    if(!reused) break;
+  }
+  return code;
+}
 static bool postBytes(const char* path, const char* contentType, const uint8_t* data, size_t len, String* resp=nullptr){
-  if(WiFi.status()!=WL_CONNECTED) return false;
-  WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(8);
-  HTTPClient http; String url=String(REPORT_BASE)+path;
-  if(!http.begin(cli, url)) return false;
-  http.addHeader("Content-Type", contentType);
-  int code=http.POST((uint8_t*)data, len);
-  if(resp && code==200) *resp = http.getString();
-  http.end();
+  int code=httpRequest("POST", path, contentType, data, len, resp);
   Serial.printf("[post] %.*s HTTP %d (%u B)\n", 24, path, code, (unsigned)len);
   return code>0 && code<400;
 }
@@ -147,13 +174,8 @@ static bool postJson(const char* path, const char* body, String* resp=nullptr){
 }
 
 static String getJson(const char* path){
-  if(WiFi.status()!=WL_CONNECTED) return String();
-  WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(8);
-  HTTPClient http; String url=String(REPORT_BASE)+path;
-  if(!http.begin(cli, url)) return String();
-  int code=http.GET();
-  String body = (code==200) ? http.getString() : String();
-  http.end();
+  String body;
+  httpRequest("GET", path, nullptr, nullptr, 0, &body);
   return body;
 }
 
@@ -212,11 +234,11 @@ static void otaConfirmIfPending(){
     Serial.println("[ota] 新固件已确认有效");
   }
 }
-// 版本不同则从 REPORT_BASE+"/firmware" 下载升级; 成功自动重启进新固件, 失败继续跑旧固件。
-// URL 由 config.h 的 REPORT_BASE 自拼, 服务器地址只此一处(不进 /config 响应)。
+// 版本不同则从 OTA_BASE+"/firmware" 下载升级; 成功自动重启进新固件, 失败继续跑旧固件。
+// URL 由 config.h 的 OTA_BASE 自拼(不进 /config 响应)。OTA 很少用, 仍走 HTTPS, 不和上报共用明文连接。
 static void otaMaybeUpdate(const char* ver){
   if(!ver || !*ver || strcmp(ver, FW_VER)==0) return;          // 无广播 / 已是最新
-  String url = String(REPORT_BASE) + "/firmware";
+  String url = String(OTA_BASE) + "/firmware";
   Serial.printf("[ota] 新版本 %s (当前 %s), 升级: %s\n", ver, FW_VER, url.c_str());
   WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(20);
   httpUpdate.rebootOnUpdate(true);
