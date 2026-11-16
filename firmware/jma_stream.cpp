@@ -12,6 +12,8 @@ JmaStream::JmaStream(double fs, int half_m) : fs_(fs) {
   // 不在此构建抽头: 全局静态构造期堆未必就绪, std::vector 分配会 bad_alloc->abort。
   // 延后到首次 reset()(运行期, 堆已就绪); 设备侧由 setup() 预热。
   built_ = false; wpos_ = 0; heapN_ = 0;
+  // 延迟线清零(无堆分配): 检测器空闲期就开始 feed, 开机后未满一圈就触发时不能读到未初始化值
+  std::memset(dx_, 0, sizeof dx_); std::memset(dy_, 0, sizeof dy_); std::memset(dz_, 0, sizeof dz_);
 }
 
 // 由 G(f) 逆FFT 得时域脉冲响应, 取对称 FIR 抽头。G 实偶 -> h 实偶 -> 零相位对称。
@@ -39,6 +41,16 @@ void JmaStream::reset(){
   std::memset(dz_, 0, sizeof(float)*L_);
   wpos_ = 0;
   heapN_ = 0;
+}
+
+void JmaStream::begin_event(){
+  if(!built_){ buildTaps(); built_ = true; }     // 惰性构建, 但不清延迟线(保留触发前波形)
+  heapN_ = 0;
+}
+
+void JmaStream::feed(double dx, double dy, double dz){
+  dx_[wpos_] = (float)dx; dy_[wpos_] = (float)dy; dz_[wpos_] = (float)dz;
+  if(++wpos_ >= L_) wpos_ = 0;
 }
 
 void JmaStream::heapPush(double v){
@@ -75,8 +87,7 @@ void JmaStream::emit(){
 }
 
 void JmaStream::push(double dx, double dy, double dz){
-  dx_[wpos_] = (float)dx; dy_[wpos_] = (float)dy; dz_[wpos_] = (float)dz;
-  if(++wpos_ >= L_) wpos_ = 0;
+  feed(dx, dy, dz);
   emit();
 }
 

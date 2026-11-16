@@ -29,7 +29,7 @@
 #error "config.h 缺 OTA_BASE(OTA 下载用的 https 基址), 见 config.example.h"
 #endif
 
-static const char*    FW_VER = "eq-1.6.0";    // + 上报改局域网明文 HTTP + 复用一条 keep-alive 连接(OTA 仍 HTTPS)
+static const char*    FW_VER = "eq-1.7.0";    // + 触发/噪声底改用 0.5–10Hz 检测频带(滤撞击类高频脉冲误报)
 static const double   FS = 100.0;
 static const uint32_t WIFI_TIMEOUT_MS = 10000;
 static const int      NVS_RING = 16;          // 断网最多缓冲的事件数(离线只存标量, 省 NVS)
@@ -70,8 +70,8 @@ volatile uint32_t g_evStartIdx = 0;            // 事件起点样本序号
 volatile uint32_t g_evEndIdx   = 0;            // 事件结束(含 hold-off)时的样本序号
 
 // --- 遥测(core0 发布, loop 读): 用 volatile float, 32位读写无撕裂; 跨核竞争仅丢极少量, 无害 ---
-volatile float g_noiseGal = 0;                 // 当前噪声底
-volatile float g_peakGal  = 0;                 // 自上次心跳以来 |动态| 峰值(心跳时取走清零)
+volatile float g_noiseGal = 0;                 // 当前噪声底(0.5–10Hz 检测频带)
+volatile float g_peakGal  = 0;                 // 自上次心跳以来检测频带内 |动态| 峰值(心跳时取走清零)
 
 // --- 配置热更新握手: loop 写 g_pendingCfg 后置位 g_cfgPending, 采样任务在安全点取用 ---
 portMUX_TYPE g_cfgMux = portMUX_INITIALIZER_UNLOCKED;

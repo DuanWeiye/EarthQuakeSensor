@@ -1,6 +1,8 @@
 #include "../firmware/detector.h"
 #include <cstdio>
 #include <cmath>
+#include <vector>
+#include <initializer_list>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -182,7 +184,8 @@ int main(){
     for(int i=0;i<3000;i++){ float s=5.0f*std::sin(2*M_PI*5.0*i/fs); d.push(s,0,980.665f);
       if(!d.active() && endedAt<0) endedAt=i; }
     EventSummary ev; bool got=d.poll_event(ev);
-    check("持续弱扰动下事件在 tail_max 内强制收尾", endedAt>0 && endedAt<=(int)(5.0*fs)+5);
+    // 允许 0.5s 余量: 触发按 0.5–10Hz 带通量判, 60gal 正弦骤停后滤波器拖尾约 0.3s 仍超触发阈值
+    check("持续弱扰动下事件在 tail_max 内强制收尾", endedAt>0 && endedAt<=(int)(5.5*fs));
     check("强制收尾的事件仍入库", got && ev.strong_s>2.5 && ev.strong_s<3.5);
   }
 
@@ -196,6 +199,90 @@ int main(){
     check("噪声底不随 20s 扰动飙升(旧 EMA 会到 ~5gal)", d.noise_floor() < nf0*1.3+0.05);
     for(int i=0;i<10000;i++){ float s=8.0f*std::sin(2*M_PI*5.0*i/fs); d.push(s,0,980.665f); }
     check("扰动持续 >窗口 后噪声底跟上新环境(仍自适应)", d.noise_floor() > 3.0);
+  }
+
+  // ---- 以下为 2026-11-16 撞击误报 #39 的回归(触发改用 0.5–10Hz 检测频带) ----
+
+  // 12) 合成撞击: 每 1.5s 一下 30Hz 衰减脉冲(峰值约 68gal 全频带, τ=50ms), 共 4 下(跨度 4.5s > min_dur)。
+  //     旧逻辑按全频带 |a| 判, 会把"首末跨度"当强晃时长录成事件; 新逻辑在频带内压到约 7gal, 不触发。
+  //     注意带通对短脉冲只压约 4~9 倍(脉冲越短频谱越宽): 同类撞击再重约 4 倍仍会入库(震度 1.3~1.9,
+  //     min_keisoku 挡不住), 目前没有第二道兜底, 见用例 13 的幅度边界。
+  {
+    Detector d(fs, rcfg());
+    for(int i=0;i<3000;i++) d.push(noise(0.8f),noise(0.8f),980.665f+noise(0.8f));
+    double nf0=d.noise_floor();
+    bool anyActive=false;
+    for(int k=0;k<4;k++){
+      for(int i=0;i<150;i++){
+        float p = i<20 ? 60.0f*std::exp(-i/5.0f)*std::sin(2*M_PI*30.0*i/fs) : 0.0f;
+        if(d.push(p+noise(0.8f), 0.7f*p+noise(0.8f), 980.665f+0.8f*p+noise(0.8f))) anyActive=true;
+      }
+    }
+    for(int i=0;i<300;i++) d.push(noise(0.8f),noise(0.8f),980.665f+noise(0.8f));
+    EventSummary ev;
+    check("高频撞击脉冲不触发", !anyActive);
+    check("高频撞击脉冲不入库", !d.poll_event(ev));
+    check("撞击不抬高噪声底", d.noise_floor() < nf0*1.3+0.1);
+  }
+
+  // 13) 真实波形回放(设备 100Hz 原始三轴, gal, 含重力; 生产配置 min_keisoku=0.5):
+  //     #36 2026-09-17 茨城県南部 M4.8(当地震度 1–2) 设备原始震度 2.6, 全频带峰 13.7 gal
+  //     #37 2026-09-29 04:45 设备原始震度 2.8, 全频带峰 19.3 gal
+  //     #39 2026-11-16 08:33 撞击误报(气象厅无对应地震)
+  //     scale: 动态部分(相对开头 5s 静止均值)按倍数缩放, 锁住灵敏度与误报两头的余量。
+  {
+    struct Case { const char* file; double floor; double scale; bool quake; double shindo, peak; };
+    const Case cases[]={
+      {"data/eq36.csv",10,1.0, true,2.6,13.7}, {"data/eq37.csv",10,1.0, true,2.8,19.3}, {"data/eq39.csv",10,1.0,false,0,0},
+      {"data/eq36.csv", 8,1.0, true,2.6,13.7},                // 拟下调 floor_min 到 8: 震度不变
+      {"data/eq36.csv", 8,0.85,true,  0,   0},                // 弱 15% 的同类地震仍能录到
+      {"data/eq39.csv", 8,2.0,false,  0,   0},                // 重一倍的同类撞击仍不入库
+    };
+    for(const Case& c: cases){
+      char name[200];
+      FILE* f=std::fopen(c.file,"r");
+      std::snprintf(name,sizeof name,"%s 可读",c.file); check(name, f!=nullptr);
+      if(!f) continue;
+      std::vector<float> v; float x=0,y=0,z=0;
+      while(std::fscanf(f,"%f,%f,%f",&x,&y,&z)==3){ v.push_back(x); v.push_back(y); v.push_back(z); }
+      std::fclose(f);
+      int n=(int)v.size()/3;
+      double base[3]={0,0,0}; int nb=n<500?n:500;
+      for(int i=0;i<nb;i++) for(int k=0;k<3;k++) base[k]+=v[3*i+k]/nb;
+      DetConfig cfg=rcfg(); cfg.min_keisoku=0.5; cfg.floor_min=c.floor;
+      Detector d(fs,cfg);
+      int evCnt=0; EventSummary ev{}, got{};
+      auto feed=[&](int i){
+        float s[3]; for(int k=0;k<3;k++) s[k]=(float)(base[k]+c.scale*(v[3*i+k]-base[k]));
+        d.push(s[0],s[1],s[2]); if(d.poll_event(ev)){ evCnt++; got=ev; } };
+      for(int i=0;i<n;i++) feed(i);
+      for(int i=0;i<300 && n>0;i++) feed(n-1);                // 补静止让事件收尾
+      const char* tag=c.quake?"真震":"撞击";
+      if(c.quake){
+        std::snprintf(name,sizeof name,"%s ×%.2f floor%.0f %s入库 1 条",c.file,c.scale,c.floor,tag); check(name, evCnt==1);
+        if(c.shindo>0){
+          std::snprintf(name,sizeof name,"%s floor%.0f 震度=%.1f(得 %.2f, 不受触发早晚影响)",c.file,c.floor,c.shindo,got.keisoku);
+          check(name, evCnt==1 && std::fabs(got.keisoku-c.shindo)<0.05);
+          std::snprintf(name,sizeof name,"%s 峰值为全频带原始值 %.1f(得 %.1f)",c.file,c.peak,got.peak_gal);
+          check(name, evCnt==1 && std::fabs(got.peak_gal-c.peak)<=0.3);
+        }
+      } else {
+        std::snprintf(name,sizeof name,"%s ×%.1f floor%.0f %s不入库",c.file,c.scale,c.floor,tag); check(name, evCnt==0);
+      }
+    }
+  }
+
+  // 14) 设备被挪动(姿态阶跃 50/100/300 gal 并保持): 不入库, 且事件能收尾。
+  //     旧逻辑按全频带判, 重力 EMA 收敛的 1~2s 里一直超阈, 会录成震度 3.7~5.2 的假事件; 0.5Hz 高通把阶跃压下去。
+  //     代价: 0.2–0.5Hz 的纯长周期晃动触发灵敏度下降(见 README 检测频带一节)。
+  for(float step: {50.0f, 100.0f, 300.0f}){
+    Detector d(fs, rcfg());
+    for(int i=0;i<3000;i++) d.push(noise(0.8f),noise(0.8f),980.665f+noise(0.8f));
+    int evCnt=0; EventSummary ev;
+    for(int i=0;i<2000;i++){ d.push(step+noise(0.8f),noise(0.8f),980.665f-step*0.05f+noise(0.8f)); if(d.poll_event(ev)) evCnt++; }
+    char name[120];
+    std::snprintf(name,sizeof name,"姿态阶跃 %.0fgal 不入库", step); check(name, evCnt==0);
+    std::snprintf(name,sizeof name,"姿态阶跃 %.0fgal 后事件已收尾", step); check(name, !d.active());
   }
 
   std::printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);

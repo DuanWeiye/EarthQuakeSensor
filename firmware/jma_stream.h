@@ -8,6 +8,8 @@
 // 且用的是"整段最强 0.3s"而非"最后20s", 修正长事件低估。
 //
 // 用法: reset() -> 每样本 push(dx,dy,dz)(去重力后的动态加速度, gal) -> finish() -> keisoku()。
+// 检测器用法: 空闲期每样本 feed() 只写延迟线(不算 FIR); 触发时 begin_event() 只清 top-K、保留延迟线,
+// 这样事件开头的滤波输出用的是真实的触发前波形(而非补零), 震度不受触发时刻早晚影响。
 // 纯 C++17, 不依赖 Arduino, 可主机端用 FFT 版对拍。
 class JmaStream {
  public:
@@ -15,8 +17,10 @@ class JmaStream {
   // fs: 采样率; half_m: FIR 半窗(抽头数 = 2*half_m+1, 越大越贴近频域 oracle)。
   explicit JmaStream(double fs, int half_m = 256);
   void reset();                            // 开始新事件: 清延迟线 + top-K
-  void push(double dx, double dy, double dz);  // 喂一个样本(三轴动态加速度 gal)
-  void finish();                           // 事件结束: 冲刷 FIR 尾部(补 M 个零样本)
+  void begin_event();                      // 开始新事件: 只清 top-K, 保留延迟线里的触发前波形
+  void feed(double dx, double dy, double dz);  // 空闲期: 只写延迟线, 不出滤波值(3 次赋值, 开销可忽略)
+  void push(double dx, double dy, double dz);  // 事件期: 写延迟线并出一个滤波值入 top-K
+  void finish();                           // 事件结束: 冲刷 FIR 尾部(补 M 个零样本; 延迟线随后由 feed 重新填满)
   double a0() const;                        // 第K大滤波幅度(gal); 不足K个样本返回0
   double keisoku() const;                   // 計測震度 = round(2*log10(a0)+0.94)
  private:
